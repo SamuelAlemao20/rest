@@ -23,38 +23,39 @@ class _OrderManagementScreenState extends State<OrderManagementScreen>
   final AudioPlayer _audioPlayer = AudioPlayer();
   StreamSubscription? _ordersSubscription;
   final RestaurantService _restaurantService = RestaurantService();
+  final PrintingService _printingService = PrintingService();
 
   bool _isLoading = true;
   String? _errorMessage;
   String? _restaurantId;
-  bool _isStoreOpen = false;
+  DocumentSnapshot? _restaurantSnapshot;
+
+  // NOVO: Controle de sessão para permissão de áudio
+  bool _isSessionActive = false;
 
   @override
   void initState() {
     super.initState();
     _tabController = TabController(length: 3, vsync: this);
     _audioPlayer.setReleaseMode(ReleaseMode.release);
-    _fetchRestaurantIdAndStatus();
+    _fetchRestaurantData();
   }
 
-  Future<void> _fetchRestaurantIdAndStatus() async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) {
-      if (mounted) _handleError("Usuário não autenticado.");
-      return;
-    }
-
+  Future<void> _fetchRestaurantData() async {
     try {
+      final user = FirebaseAuth.instance.currentUser;
+      if (user == null) {
+        _handleError("Usuário não autenticado.");
+        return;
+      }
       final restaurantDoc = await _restaurantService.getRestaurantByUser(
         user.uid,
       );
-
       if (mounted) {
         if (restaurantDoc != null && restaurantDoc.exists) {
-          final data = restaurantDoc.data() as Map<String, dynamic>?;
           setState(() {
             _restaurantId = restaurantDoc.id;
-            _isStoreOpen = data?['isOpen'] ?? false;
+            _restaurantSnapshot = restaurantDoc;
             _isLoading = false;
           });
           _listenForNewOrders();
@@ -63,7 +64,7 @@ class _OrderManagementScreenState extends State<OrderManagementScreen>
         }
       }
     } catch (e) {
-      _handleError("Ocorreu um erro ao buscar os dados do restaurante.");
+      _handleError("Ocorreu um erro ao buscar os dados do restaurante: $e");
     }
   }
 
@@ -85,6 +86,9 @@ class _OrderManagementScreenState extends State<OrderManagementScreen>
         .orderBy('timestamp', descending: true);
 
     _ordersSubscription = query.snapshots().listen((snapshot) {
+      // Só toca o som se a sessão foi iniciada pelo usuário
+      if (!_isSessionActive) return;
+
       for (var docChange in snapshot.docChanges) {
         if (docChange.type == DocumentChangeType.added) {
           _playSound();
@@ -99,22 +103,6 @@ class _OrderManagementScreenState extends State<OrderManagementScreen>
       await _audioPlayer.play(AssetSource('audio/notification.mp3'));
     } catch (e) {
       debugPrint("Erro detalhado ao tocar o som: $e");
-    }
-  }
-
-  Future<void> _toggleStoreStatus(bool value) async {
-    if (_restaurantId == null) return;
-    setState(() => _isStoreOpen = value);
-    try {
-      await _restaurantService.updateRestaurantStatus(_restaurantId!, value);
-    } catch (e) {
-      // Reverte em caso de erro
-      setState(() => _isStoreOpen = !value);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Erro ao atualizar o status da loja.')),
-        );
-      }
     }
   }
 
@@ -138,44 +126,21 @@ class _OrderManagementScreenState extends State<OrderManagementScreen>
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(16.0),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Text(_errorMessage!, textAlign: TextAlign.center),
-                const SizedBox(height: 20),
-                ElevatedButton(
-                  onPressed: () async {
-                    await FirebaseAuth.instance.signOut();
-                    if (mounted) {
-                      Navigator.of(context).pushAndRemoveUntil(
-                        MaterialPageRoute(
-                          builder: (context) => const LoginScreen(),
-                        ),
-                        (route) => false,
-                      );
-                    }
-                  },
-                  child: const Text("Voltar para o Login"),
-                ),
-              ],
-            ),
+            child: Text(_errorMessage!, textAlign: TextAlign.center),
           ),
         ),
       );
     }
 
+    bool isOpen = _restaurantSnapshot != null
+        ? (_restaurantSnapshot!.data() as Map<String, dynamic>)['isOpen'] ??
+              false
+        : false;
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Gerenciador de Pedidos'),
         actions: [
-          Tooltip(
-            message: _isStoreOpen ? 'Loja Aberta' : 'Loja Fechada',
-            child: Switch(
-              value: _isStoreOpen,
-              onChanged: _toggleStoreStatus,
-              activeColor: Colors.green,
-            ),
-          ),
           IconButton(
             icon: const Icon(Icons.restaurant_menu),
             tooltip: 'Gerenciar Cardápio',
@@ -209,18 +174,113 @@ class _OrderManagementScreenState extends State<OrderManagementScreen>
           ],
         ),
       ),
-      body: TabBarView(
-        controller: _tabController,
+      body: Stack(
         children: [
-          OrderListTab(status: 'pendente', restaurantId: _restaurantId!),
-          OrderListTab(status: 'em preparo', restaurantId: _restaurantId!),
-          OrderListTab(status: 'pronto', restaurantId: _restaurantId!),
+          Column(
+            children: [
+              // Barra de status Aberto/Fechado
+              Container(
+                color: Colors.black12,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16.0,
+                  vertical: 8.0,
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      isOpen ? 'LOJA ABERTA' : 'LOJA FECHADA',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        color: isOpen
+                            ? Colors.green.shade700
+                            : Colors.red.shade700,
+                      ),
+                    ),
+                    Switch(
+                      value: isOpen,
+                      onChanged: (value) async {
+                        await _restaurantService.updateRestaurantStatus(
+                          _restaurantId!,
+                          value,
+                        );
+                        _fetchRestaurantData(); // Recarrega os dados para atualizar a UI
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: TabBarView(
+                  controller: _tabController,
+                  children: [
+                    OrderListTab(
+                      status: 'pendente',
+                      restaurantId: _restaurantId!,
+                    ),
+                    OrderListTab(
+                      status: 'em preparo',
+                      restaurantId: _restaurantId!,
+                    ),
+                    OrderListTab(
+                      status: 'pronto',
+                      restaurantId: _restaurantId!,
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          // NOVO: Overlay para iniciar a sessão
+          if (!_isSessionActive)
+            Positioned.fill(
+              child: Container(
+                color: Colors.black.withOpacity(0.7),
+                child: Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(
+                        Icons.play_circle_fill,
+                        color: Colors.white,
+                        size: 80,
+                      ),
+                      const SizedBox(height: 20),
+                      const Text(
+                        'Pronto para receber pedidos?',
+                        style: TextStyle(color: Colors.white, fontSize: 22),
+                      ),
+                      const SizedBox(height: 20),
+                      ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 40,
+                            vertical: 20,
+                          ),
+                        ),
+                        onPressed: () {
+                          // A primeira interação do usuário que habilita o som.
+                          _audioPlayer.resume();
+                          setState(() {
+                            _isSessionActive = true;
+                          });
+                          // Toca um som de confirmação.
+                          _playSound();
+                        },
+                        child: const Text('CLIQUE PARA INICIAR'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
     );
   }
 }
 
+// O widget OrderListTab permanece o mesmo
 class OrderListTab extends StatefulWidget {
   final String status;
   final String restaurantId;
@@ -237,6 +297,8 @@ class OrderListTab extends StatefulWidget {
 
 class _OrderListTabState extends State<OrderListTab> {
   late final Stream<QuerySnapshot> _ordersStream;
+  final OrderManagementService _orderService = OrderManagementService();
+  final PrintingService _printingService = PrintingService();
 
   @override
   void initState() {
@@ -251,22 +313,23 @@ class _OrderListTabState extends State<OrderListTab> {
 
   @override
   Widget build(BuildContext context) {
-    final service = OrderManagementService();
-    final printingService = PrintingService();
-
     return StreamBuilder<QuerySnapshot>(
       stream: _ordersStream,
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Center(child: CircularProgressIndicator());
         }
+        if (snapshot.hasError) {
+          return Center(
+            child: Text(
+              'Erro ao carregar pedidos: ${snapshot.error.toString()}',
+            ),
+          );
+        }
         if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
           return Center(
             child: Text('Nenhum pedido na categoria "${widget.status}".'),
           );
-        }
-        if (snapshot.hasError) {
-          return const Center(child: Text('Erro ao carregar os pedidos.'));
         }
 
         final orders = snapshot.data!.docs;
@@ -276,8 +339,6 @@ class _OrderListTabState extends State<OrderListTab> {
           itemBuilder: (context, index) {
             final order = orders[index];
             final orderData = order.data() as Map<String, dynamic>;
-            orderData['id'] = order.id;
-
             final items = (orderData['items'] as List)
                 .cast<Map<String, dynamic>>();
             final timestamp = orderData['timestamp'] as Timestamp?;
@@ -312,8 +373,7 @@ class _OrderListTabState extends State<OrderListTab> {
                       'Total: R\$ ${orderData['totalAmount'].toStringAsFixed(2)}',
                       style: const TextStyle(fontWeight: FontWeight.bold),
                     ),
-                    if (orderData['orderType'] == 'entrega' &&
-                        orderData['deliveryAddress'] != null)
+                    if (orderData['orderType'] == 'entrega')
                       Text(
                         'Endereço: ${orderData['deliveryAddress']['street']}, ${orderData['deliveryAddress']['number']}',
                       ),
@@ -328,7 +388,7 @@ class _OrderListTabState extends State<OrderListTab> {
                       children: [
                         if (widget.status == 'pendente') ...[
                           TextButton(
-                            onPressed: () => service.updateOrderStatus(
+                            onPressed: () => _orderService.updateOrderStatus(
                               order.id,
                               'rejeitado',
                             ),
@@ -337,21 +397,26 @@ class _OrderListTabState extends State<OrderListTab> {
                           const SizedBox(width: 8),
                           FilledButton(
                             onPressed: () {
-                              printingService.printOrder(orderData);
-                              service.updateOrderStatus(order.id, 'em preparo');
+                              _printingService.printOrder(orderData);
+                              _orderService.updateOrderStatus(
+                                order.id,
+                                'em preparo',
+                              );
                             },
                             child: const Text('ACEITAR E IMPRIMIR'),
                           ),
                         ],
                         if (widget.status == 'em preparo')
                           FilledButton(
-                            onPressed: () =>
-                                service.updateOrderStatus(order.id, 'pronto'),
+                            onPressed: () => _orderService.updateOrderStatus(
+                              order.id,
+                              'pronto',
+                            ),
                             child: const Text('MARCAR COMO PRONTO'),
                           ),
                         if (widget.status == 'pronto')
                           FilledButton.tonal(
-                            onPressed: () => service.updateOrderStatus(
+                            onPressed: () => _orderService.updateOrderStatus(
                               order.id,
                               'finalizado',
                             ),
